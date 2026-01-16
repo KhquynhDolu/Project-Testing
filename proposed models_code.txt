@@ -1,0 +1,332 @@
+!pip install keras-tcn
+!pip install EMD-signal
+
+from PyEMD import EMD, CEEMDAN, EEMD
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from tensorflow import keras
+from tcn import TCN
+import random
+
+tf.keras.backend.set_floatx('float64')
+
+def wavelet_transform(x, J):
+    N = len(x)
+    C = np.zeros(shape=(J + 1, N))
+    # W: wavelet coefficients
+    W = np.zeros(shape=(J + 1, N))
+    C[0, :] = x.copy()
+    for j in range(1, J + 1):
+        for k in range(1, N):
+            C[j, k] = 1 / 2 * (C[j - 1, k] + C[j - 1, k - np.power(2, j - 1)])
+            W[j, k] = C[j - 1][k] - C[j, k]
+
+    W[0, :] = C[J, :]
+    return W[:, np.power(2, J):]
+
+def decompose(series, max_imfs, type='EEMD'):
+    """
+    Time series decomposition
+    :param series: The sequence to be decomposed
+    :param max_imfs: Number of IMFS
+    :param type: EMD
+    :return:
+    """
+
+    if type == 'EEMD':
+        eemd = EEMD()
+        imfs_res = eemd.eemd(S=series, max_imf=max_imfs)
+        return imfs_res
+    elif type == 'wave':
+        sub_series = wavelet_transform(series, max_imfs)
+        return sub_series
+    else:
+        kernel_series = []
+        kernel_series.append(np.power(series, 5))
+        kernel_series.append(np.power(series, 1/5))
+        kernel_series.append(np.power(series, 4))
+        kernel_series.append(np.power(series, 1/4))
+        kernel_series.append(np.power(series, 3))
+        kernel_series.append(np.power(series, 1/3))
+        kernel_series.append(np.power(series, 2))
+        kernel_series.append(series)
+        kernel_series = np.array(kernel_series)
+        return kernel_series
+
+# Load input with correct Train/Validation/Test split - 70% train, 10% validation, 20% test
+def load_input(file_path, time_steps, fea_nums):
+    df = pd.read_csv(file_path, index_col='date')
+    df.index = pd.to_datetime(df.index)
+    df = df[(df.index >= '2020-01-01') & (df.index <= '2025-05-10')]
+    df = df.resample('D').sum()
+
+    aqi_list = ["pm25", "pm10", "o3", "no2", "co"]
+    aqi_data = df[aqi_list]
+    n_imfs = fea_nums - 1
+
+    # Rescale the data
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(aqi_data.values)
+
+    imfs_list = []
+    for i in range(scaled_data.shape[1]):
+        imfs_res = decompose(series=scaled_data[:, i], max_imfs=n_imfs, type='wave')
+        imfs_list.append(imfs_res)
+    imfs_arr = np.array(imfs_list)
+    imfs_arr = np.transpose(imfs_arr, axes=[2, 0, 1])
+
+    # Create time windows for the dataset
+    X = []
+    label = []
+    for i in range(len(imfs_arr) - time_steps):
+        X.append(imfs_arr[i:i + time_steps, ...])
+        label.append(scaled_data[i + time_steps, :])
+
+    all_X = np.array(X)
+    all_label = np.array(label)
+
+    # Split the data: 70% train, 10% validation, 20% test
+    total_size = len(all_X)
+    train_size = int(total_size * 0.7)
+    valid_size = int(total_size * 0.1)
+    test_size = total_size - train_size - valid_size
+
+    # Train/Validation/Test split based on the total size of the dataset
+    train_X = all_X[:train_size, ...]
+    train_label = all_label[:train_size, ...]
+
+    valid_X = all_X[train_size:train_size + valid_size, ...]
+    valid_label = all_label[train_size:train_size + valid_size, ...]
+
+    test_X = all_X[train_size + valid_size:, ...]
+    test_label = all_label[train_size + valid_size:, ...]
+
+    return np.array(train_X), np.array(train_label), np.array(valid_X), np.array(valid_label), np.array(test_X), np.array(test_label), scaler
+
+
+def seed_tensorflow(seed=625):
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+def RMSE(true, prediction):
+    return np.sqrt(mean_squared_error(true, prediction))
+
+def plot(prediction, true):
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.plot(range(len(true)), true)
+    ax.plot(range(len(prediction)), prediction, marker='*')
+    plt.legend(['true', 'prediction'])
+    plt.show()
+
+def plot_aqi_predictions(predictions, true, aqi_list, start_date='01-01-2020', end_date='2025-05-10'):
+    # Convert true and predicted values to Pandas DataFrame
+    true_df = pd.DataFrame(true, columns=aqi_list)
+    pred_df = pd.DataFrame(predictions, columns=aqi_list)
+
+    # Get the actual date range based on the number of predictions
+    date_range = pd.date_range(start=start_date, end=end_date, periods=predictions.shape[0])
+
+    # Create a figure with subplots for each aqi type
+    n_aqi = len(aqi_list)
+    nrows = (n_aqi + 1) // 2  # 2 columns of subplots
+    fig, axes = plt.subplots(nrows=nrows, ncols=2, figsize=(12, 4 * nrows))
+    axes = axes.flatten()  # Convert 2D array of subplots to 1D array
+
+    # Plot the true and predicted values for each aqi type
+    for i, aqi in enumerate(aqi_list):
+        ax = axes[i]
+        ax.plot(date_range, true_df[aqi], label='True')
+        ax.plot(date_range, pred_df[aqi], label='Prediction', marker='*')
+        ax.set_title(aqi)
+        ax.legend()
+
+    # Adjust the layout of the figure
+    plt.tight_layout()
+    plt.show()
+
+class SG_TCN(keras.layers.Layer):
+    def __init__(self, units):
+        super(SG_TCN, self).__init__()
+        self.units = units
+        self.tcn = TCN(nb_filters=64, kernel_size=2, nb_stacks=1, dilations=(1, 2, 4), activation='tanh')
+
+    def call(self, inputs):
+        return self.tcn(inputs)
+
+class GraphFullLayer(keras.layers.Layer):
+    def __init__(self, node_nums, fea_nums, attention_head_nums, hidden_dims, out_dims):
+        super(GraphFullLayer, self).__init__()
+        self.node_nums = node_nums
+        self.fea_nums = fea_nums
+        self.attention_head_nums = attention_head_nums
+        self.hidden_dims = hidden_dims
+        self.out_dims = out_dims
+        self.Wq_list = []
+        self.Wk_list = []
+        self.GCN_list = []
+        for i in range(self.attention_head_nums):
+            self.Wq = keras.layers.Dense(units=self.fea_nums, use_bias=False)
+            self.Wk = keras.layers.Dense(units=self.fea_nums, use_bias=False)
+            self.Wq_list.append(self.Wq)
+            self.Wk_list.append(self.Wk)
+            self.GCN_list.append(GCN(hidden_dim=self.hidden_dims, out_dim=self.out_dims))
+
+    def call(self, QK, A):
+        A_full_list = []
+        for i in range(self.attention_head_nums):
+            Wq = self.Wq_list[i]
+            Wk = self.Wk_list[i]
+            GCN = self.GCN_list[i]
+            temp = tf.matmul(Wq(QK), Wk(QK), transpose_b=True) / tf.sqrt(tf.cast(self.fea_nums, dtype=tf.float64))
+            A_full = keras.activations.softmax(temp)
+            updated_g = GCN((QK, A_full))
+            A_full_list.append(tf.expand_dims(updated_g, axis=1))
+
+        A_full_multi = tf.concat(A_full_list, axis=1)
+        mean_updated_g = tf.reduce_mean(A_full_multi, axis=1)
+        return mean_updated_g
+
+class GCNLayer(keras.layers.Layer):
+    def __init__(self, units, activation='relu', dropout_rate=0., use_bias=True, l2_reg=0):
+        super(GCNLayer, self).__init__()
+        self.units = units
+        self.activation = activation
+        self.dropout_rate = dropout_rate
+        self.use_bias = use_bias
+        self.l2_reg = l2_reg
+
+    def build(self, input_shape):
+        feature_shape = input_shape[0]
+        input_dim = int(feature_shape[-1])
+        self.kernel = self.add_weight(shape=(input_dim, self.units),
+                                      initializer=keras.initializers.GlorotUniform(),
+                                      regularizer=keras.regularizers.l2(self.l2_reg),
+                                      name='kernel')
+        if self.use_bias:
+            self.bias = self.add_weight(shape=(self.units,), initializer=keras.initializers.Zeros(), name='bias')
+        self.dropout = keras.layers.Dropout(self.dropout_rate)
+
+    def call(self, inputs):
+        fea_vector, A = inputs
+        fea_vector = self.dropout(fea_vector)
+        output = tf.matmul(tf.matmul(A, fea_vector), self.kernel)
+        if self.use_bias:
+            output += self.bias
+        if self.activation == 'relu':
+            hidden = tf.nn.relu(output)
+        elif self.activation == 'softmax':
+            hidden = tf.nn.softmax(output)
+        elif self.activation == 'tanh':
+            hidden = tf.nn.tanh(output)
+        return hidden
+
+class GCN(keras.Model):
+    def __init__(self, hidden_dim, out_dim, l2_reg=0):
+        super(GCN, self).__init__()
+        self.gc1 = GCNLayer(units=hidden_dim, activation='relu', l2_reg=l2_reg, dropout_rate=0.)
+        self.gc2 = GCNLayer(units=out_dim, activation='relu', l2_reg=l2_reg, dropout_rate=0.)
+
+    def call(self, inputs):
+        fea_vector, adj = inputs
+        h1 = self.gc1(inputs)
+        h2 = self.gc2([h1, adj])
+        return h2
+
+class ESTModel(keras.Model):
+    def __init__(self, time_steps, node_nums, fea_nums, hidden_dims, out_dims, adj):
+        super(ESTModel, self).__init__()
+        self.time_steps = time_steps
+        self.node_nums = node_nums
+        self.fea_nums = fea_nums
+        self.hidden_dims = hidden_dims
+        self.out_dims = out_dims
+        self.attention_head_nums = 8
+        self.adj = adj
+        self.full_graph_list = []
+        self.tcn_list = []
+        self.dense_list = []
+        for i in range(time_steps):
+            self.full_graph_list.append(GraphFullLayer(self.node_nums, self.fea_nums, self.attention_head_nums, self.hidden_dims, self.out_dims))
+        for i in range(node_nums):
+            self.tcn_list.append(TCN(nb_filters=64, kernel_size=2, nb_stacks=1, dilations=(1, 2, 4), use_skip_connections=True, activation='relu'))
+            self.dense_list.append(keras.layers.Dense(1, activation='sigmoid'))
+
+    def call(self, inputs):
+        updated_g_list = []
+        for i in range(self.time_steps):
+            g = inputs[:, i, ...]
+            updated_g = self.full_graph_list[i](g, self.adj)
+            updated_g_list.append(tf.expand_dims(updated_g, axis=1))
+
+        updated_g_concat = tf.concat(updated_g_list, axis=1)
+        output_list = []
+        for i in range(self.node_nums):
+            node_embedding = updated_g_concat[:, :, i, :]
+            tcn_output = self.tcn_list[i](node_embedding)
+            output = self.dense_list[i](tcn_output)
+            output_list.append(output)
+
+        output_concat = tf.concat(output_list, axis=-1)
+        return output_concat
+
+def build_model(train_x, train_label, test_x, test_label, scaler, time_steps, node_nums, fea_nums, hidden_dims, out_dims, adj, epochs=200, silent=1):
+    model = ESTModel(time_steps, node_nums, fea_nums, hidden_dims, out_dims, adj)
+    model.compile(optimizer='adam', loss='mse', metrics=['mse'])
+    model.fit(x=train_x, y=train_label, validation_data=(test_x, test_label), epochs=epochs, verbose=silent)
+    prediction = model.predict(test_x)
+
+    scaled_prediction = scaler.inverse_transform(prediction)
+    scaled_label = scaler.inverse_transform(test_label)
+    rmse = RMSE(scaled_prediction, scaled_label)
+    true_series = np.concatenate((scaler.inverse_transform(model.predict(train_x))[:, 0], scaled_prediction[:, 0]), axis=0)
+    prediction_series = np.concatenate((scaler.inverse_transform(train_label)[:, 0], scaled_label[:, 0]), axis=0)
+    plot(true_series, prediction_series)
+
+    plot(scaler.inverse_transform(model.predict(train_x))[:, 1], scaler.inverse_transform(train_label)[:, 1])
+    plot(scaled_prediction[:, 0], scaled_label[:, 0])
+    aqi_list = ["pm25", "pm10", "o3", "no2", "co"]
+    plot_aqi_predictions(scaled_prediction, scaled_label, aqi_list)
+    return rmse
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+if __name__ == '__main__':
+    file_path = '/content/drive/MyDrive/[A] THESIS_2025/THESIS/aqi_filled_dataset_final_Run1.csv'
+    time_steps = 10
+    node_nums = 5
+    fea_nums = 9
+    hidden_dims = 3
+    out_dims = 5
+    adj = None
+
+    # Hyperparameter search space
+    time_steps_list = [9]
+    hidden_dims_list = [3]
+    out_dims_list = [5]
+
+    best_time_steps = 0
+    best_out_dims = 0
+    best_hidden_dims = 0
+    best_rmse = 9990
+    for time_steps in time_steps_list:
+        for hidden_dims in hidden_dims_list:
+            for out_dims in out_dims_list:
+                seed_tensorflow()
+                train_X, train_label, valid_X, valid_label, test_X, test_label, scaler = load_input(file_path=file_path, time_steps=time_steps, fea_nums=fea_nums)
+                rmse = build_model(train_X, train_label, valid_X, valid_label, scaler, time_steps=time_steps, node_nums=node_nums, fea_nums=fea_nums, hidden_dims=hidden_dims, out_dims=out_dims, adj=adj, epochs=200, silent=1)
+
+                if rmse < best_rmse:
+                    best_rmse = rmse
+                    best_time_steps = time_steps
+                    best_out_dims = out_dims
+                    best_hidden_dims = hidden_dims
+                print('-----', time_steps, hidden_dims, out_dims, 'RMSE', rmse, '------')
+
+    print('Best RMSE:', best_rmse, 'Time Steps:', best_time_steps, 'Hidden Dimensions:', best_hidden_dims, 'Output Dimensions:', best_out_dims)
